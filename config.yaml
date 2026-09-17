@@ -1,0 +1,45 @@
+# Multi-BackendRag server configuration.
+# Values here are the global defaults; environment variables override them.
+# Nested keys use the "__" delimiter, e.g. DEFAULTS__CHAT_MODEL, QDRANT__HOST.
+
+defaults:
+  embed_model: ollama/bge-m3
+  chat_model: ollama/llama3.2
+  vision_model: ollama/llama3.2-vision
+  chunk_size: 700
+  chunk_overlap: 80
+  top_k: 6
+  max_ctx_chars: 3000
+
+providers:
+  ollama:
+    base_url: http://localhost:11434
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+
+auth:
+  provider: none
+  api_key_env: RAG_API_KEY
+  oidc:
+    issuer: https://keycloak.example/realms/rag
+    audience: rag-api
+    roles_claim: groups
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  max_upload_mb: 50
+
+storage:
+  root: ./storage
+
+database_url: sqlite:///./rag.db
+redis_url: redis://localhost:6379
+
+qdrant:
+  host: localhost
+  port: 6333
+
+jobs:
+  keep_result_s: 3600
