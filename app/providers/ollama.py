@@ -38,12 +38,16 @@ class OllamaProvider:
         return {key: opts[key] for key in _CHAT_OPTION_KEYS if opts.get(key) is not None}
 
     def embed(self, texts: list[str], model: str) -> list[list[float]]:
-        """Embed each text with Ollama's ``embeddings`` endpoint, in order."""
+        """Embed ``texts`` in one batched call, preserving input order.
+
+        Ollama's ``embed`` endpoint accepts a list of inputs, so a whole batch
+        travels in a single request instead of one call per text.
+        """
+        if not texts:
+            return []
         try:
-            return [
-                list(self._client.embeddings(model=model, prompt=text).embedding)
-                for text in texts
-            ]
+            response = self._client.embed(model=model, input=list(texts))
+            return [list(vector) for vector in response.embeddings]
         except ollama.ResponseError as exc:
             raise ProviderError(f"ollama embeddings failed for model {model!r}: {exc}") from exc
         except Exception as exc:
