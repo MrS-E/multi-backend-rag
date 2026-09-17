@@ -1,0 +1,300 @@
+"""Ingestion pipeline: convert → caption → sanitize → chunk → embed → index.
+
+One document event is processed end to end, with hash-based change detection so
+re-uploading unchanged content never re-embeds:
+
+* the event's content hash (or the sha256 of its bytes) is compared with the
+  stored ``documents.content_hash``; an already-indexed document with the same
+  hash is skipped;
+* a changed hash deletes the document's old vectors before the new ones are
+  written, so a document never leaves stale points behind;
+* a :class:`DeleteEvent` removes vectors, the stored raw file and the DB row.
+
+The pipeline is deliberately synchronous and session-scoped: the arq worker
+builds one instance per job. Providers and Qdrant are reached only through the
+existing ports/stores, so the whole flow is testable with in-memory fakes.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import uuid
+from collections.abc import Sequence
+
+from sqlalchemy.orm import Session
+
+from app.core.settings import Settings
+from app.domain.config_resolution import EffectiveConfig, resolve_effective_config
+from app.domain.events import DeleteEvent, SourceEvent, UpsertEvent
+from app.domain.models import DOC_STATUS_FAILED, DOC_STATUS_INDEXED
+from app.persistence.file_storage import FileStorage
+from app.persistence.models import Document, KnowledgeBase
+from app.persistence.qdrant_store import QdrantStore
+from app.providers.registry import ProviderRegistry, parse_model_str
+from app.rag.caption import caption_image
+from app.rag.chunk import Chunk, split_into_chunks
+from app.rag.convert import convert_document
+from app.rag.convert.base import KIND_IMAGE_CAPTION, ConvertedDocument, ExtractedImage
+from app.rag.embed import embed_texts
+from app.rag.index import IndexedChunk, delete_document, index_chunks
+from app.rag.sanitize import sanitize
+
+logger = logging.getLogger(__name__)
+
+#: Metadata key a connector uses to attribute a document to a source row.
+SOURCE_ID_KEY = "source_id"
+
+
+def sha256_hex(data: bytes) -> str:
+    """Return the lower-case hex sha256 of ``data``."""
+    return hashlib.sha256(data).hexdigest()
+
+
+def document_uuid(doc_id: str) -> uuid.UUID:
+    """Parse an event ``doc_id`` into the ``documents.id`` UUID it references.
+
+    Events carry the document's primary key as a string; connectors are expected
+    to mint UUIDs so upsert and delete always address the same row.
+    """
+    try:
+        return uuid.UUID(doc_id)
+    except (ValueError, AttributeError, TypeError) as exc:
+        raise ValueError(f"event doc_id must be a UUID, got {doc_id!r}") from exc
+
+
+def image_chunk_text(image: ExtractedImage, caption: str) -> str:
+    """Compose the retrievable text for one captioned image (PoC-style layout)."""
+    label = image.alt.strip()
+    description = caption.strip()
+    if label and description:
+        body = f"[Image] {label} - {description}"
+    elif description:
+        body = f"[Image] {description}"
+    elif label:
+        body = f"[Image] {label}"
+    else:
+        body = "[Image]"
+    if image.uri:
+        body += f"\n(Image path: {image.uri})"
+    return body
+
+
+class IngestionPipeline:
+    """Apply source events to one KB's index and document rows."""
+
+    def __init__(
+        self,
+        session: Session,
+        settings: Settings,
+        registry: ProviderRegistry,
+        qdrant: QdrantStore,
+        storage: FileStorage,
+    ) -> None:
+        self._session = session
+        self._settings = settings
+        self._registry = registry
+        self._qdrant = qdrant
+        self._storage = storage
+
+    def process_events(self, kb_id: uuid.UUID, events: Sequence[SourceEvent]) -> None:
+        """Process every event for ``kb_id`` in order."""
+        for event in events:
+            if isinstance(event, DeleteEvent):
+                self.process_delete(kb_id, event)
+            elif isinstance(event, UpsertEvent):
+                self.process_upsert(kb_id, event)
+            else:  # pragma: no cover - exhaustive over the SourceEvent union
+                raise ValueError(f"unsupported source event {event!r}")
+
+    def process_upsert(self, kb_id: uuid.UUID, event: UpsertEvent) -> None:
+        """Index (or re-index) a document, skipping unchanged content."""
+        kb = self._require_kb(kb_id)
+        config = resolve_effective_config(self._settings.defaults, kb.overrides)
+        doc_uuid = document_uuid(event.doc_id)
+        data = self._load_bytes(event)
+        content_hash = event.content_hash or sha256_hex(data)
+
+        existing = self._session.get(Document, doc_uuid)
+        if (
+            existing is not None
+            and existing.status == DOC_STATUS_INDEXED
+            and existing.content_hash == content_hash
+        ):
+            logger.info(
+                "skipping unchanged document",
+                extra={"kb_id": str(kb_id), "doc_id": event.doc_id},
+            )
+            return
+
+        raw_path = self._store(event, kb_id, data)
+        if existing is not None and existing.content_hash != content_hash:
+            delete_document(kb_id, event.doc_id, self._qdrant)
+
+        try:
+            indexed, vectors = self._prepare(kb_id, event, data, content_hash, config)
+            self._ensure_collection(kb_id, vectors)
+            index_chunks(kb_id, event.doc_id, indexed, vectors, self._qdrant)
+        except Exception:
+            self._update_row(kb_id, doc_uuid, event, raw_path, content_hash, DOC_STATUS_FAILED)
+            raise
+
+        self._update_row(kb_id, doc_uuid, event, raw_path, content_hash, DOC_STATUS_INDEXED)
+        self._remove_replaced_file(existing, raw_path)
+
+    def process_delete(self, kb_id: uuid.UUID, event: DeleteEvent) -> None:
+        """Remove a document's vectors, stored file and DB row."""
+        self._require_kb(kb_id)
+        doc_uuid = document_uuid(event.doc_id)
+        delete_document(kb_id, event.doc_id, self._qdrant)
+
+        document = self._session.get(Document, doc_uuid)
+        if document is None:
+            return
+        raw_path = document.raw_path
+        self._session.delete(document)
+        self._session.commit()
+
+        try:
+            self._storage.delete(raw_path)
+        except Exception as exc:  # noqa: BLE001 - best-effort file cleanup
+            logger.warning(
+                "failed to delete stored file",
+                extra={"kb_id": str(kb_id), "doc_id": event.doc_id, "error": str(exc)},
+            )
+
+    def _require_kb(self, kb_id: uuid.UUID) -> KnowledgeBase:
+        kb = self._session.get(KnowledgeBase, kb_id)
+        if kb is None:
+            raise ValueError(f"knowledge base {kb_id} not found")
+        return kb
+
+    def _load_bytes(self, event: UpsertEvent) -> bytes:
+        """Return the event's content, reading the stored file when only a path is given."""
+        if event.data is not None:
+            return event.data
+        if event.path is not None:
+            return self._storage.read(event.path)
+        raise ValueError(f"upsert event for {event.doc_id!r} carries neither data nor path")
+
+    def _store(self, event: UpsertEvent, kb_id: uuid.UUID, data: bytes) -> str:
+        """Persist inline bytes (content-addressed) or reuse the event's stored path."""
+        if event.path is not None:
+            return event.path
+        rel_path, _ = self._storage.save(kb_id, data)
+        return rel_path
+
+    def _remove_replaced_file(self, existing: Document | None, raw_path: str) -> None:
+        """Delete the previous raw file when a changed document moved to a new path."""
+        if existing is None or existing.raw_path == raw_path:
+            return
+        try:
+            self._storage.delete(existing.raw_path)
+        except Exception as exc:  # noqa: BLE001 - best-effort file cleanup
+            logger.warning(
+                "failed to delete replaced file",
+                extra={
+                    "doc_id": str(existing.id),
+                    "raw_path": existing.raw_path,
+                    "error": str(exc),
+                },
+            )
+
+    def _prepare(
+        self,
+        kb_id: uuid.UUID,
+        event: UpsertEvent,
+        data: bytes,
+        content_hash: str,
+        config: EffectiveConfig,
+    ) -> tuple[list[IndexedChunk], list[list[float]]]:
+        """Convert, caption, sanitize and chunk the document, then embed every chunk."""
+        converted = convert_document(data, event.uri, resolve_image=self._resolve_image)
+        items = self._collect_chunks(converted, config, event)
+
+        source_id = event.metadata.get(SOURCE_ID_KEY)
+        indexed = [
+            IndexedChunk(
+                chunk=chunk,
+                uri=uri,
+                content_hash=content_hash,
+                source_id=str(source_id) if source_id is not None else None,
+            )
+            for chunk, uri in items
+        ]
+        texts = [item.chunk.text for item in indexed]
+        _, embed_model = parse_model_str(config.embed_model)
+        embedder = self._registry.get_embedder(config.embed_model)
+        vectors = embed_texts(texts, embedder, embed_model)
+        return indexed, vectors
+
+    def _collect_chunks(
+        self, converted: ConvertedDocument, config: EffectiveConfig, event: UpsertEvent
+    ) -> list[tuple[Chunk, str]]:
+        """Build the (chunk, uri) pairs for the text body and every captioned image."""
+        items: list[tuple[Chunk, str]] = []
+        text = sanitize(converted.text)
+        for chunk in split_into_chunks(
+            text, config.chunk_size, config.chunk_overlap, converted.kind
+        ):
+            items.append((chunk, event.uri))
+
+        if not converted.images:
+            return items
+
+        _, vision_model = parse_model_str(config.vision_model)
+        vision = self._registry.get_vision(config.vision_model)
+        for index, image in enumerate(converted.images):
+            caption = caption_image(image.data, vision, vision_model)
+            body = sanitize(image_chunk_text(image, caption))
+            items.append(
+                (
+                    Chunk(text=body, kind=KIND_IMAGE_CAPTION, chunk_index=index),
+                    image.uri or event.uri,
+                )
+            )
+        return items
+
+    def _ensure_collection(self, kb_id: uuid.UUID, vectors: Sequence[Sequence[float]]) -> None:
+        """Create the KB's collection when it does not exist yet (dimension from vectors)."""
+        if not vectors:
+            return
+        if not self._qdrant.collection_exists(kb_id):
+            self._qdrant.create_collection(kb_id, len(vectors[0]))
+
+    def _resolve_image(self, path: str) -> bytes | None:
+        """Resolve a markdown image reference against the storage root, if present."""
+        try:
+            return self._storage.read(path)
+        except (OSError, ValueError):
+            return None
+
+    def _update_row(
+        self,
+        kb_id: uuid.UUID,
+        doc_uuid: uuid.UUID,
+        event: UpsertEvent,
+        raw_path: str,
+        content_hash: str,
+        status: str,
+    ) -> None:
+        """Create or update the ``documents`` row for an upsert."""
+        document = self._session.get(Document, doc_uuid)
+        if document is None:
+            document = Document(
+                id=doc_uuid,
+                kb_id=kb_id,
+                uri=event.uri,
+                content_hash=content_hash,
+                mime=event.mime,
+                raw_path=raw_path,
+                status=status,
+            )
+            self._session.add(document)
+        else:
+            document.uri = event.uri
+            document.content_hash = content_hash
+            document.mime = event.mime
+            document.raw_path = raw_path
+            document.status = status
+        self._session.commit()
