@@ -25,6 +25,7 @@ from app.persistence.qdrant_store import QdrantStore
 from app.providers.registry import ProviderRegistry, get_registry
 from app.services.document_service import DocumentService
 from app.services.kb_service import KBService
+from app.services.query_service import QueryService
 
 
 def get_settings_dep(request: Request) -> Settings:
@@ -117,6 +118,16 @@ def get_document_service(
     return DocumentService(session, storage, queue)
 
 
+def get_query_service(
+    session: SessionDep,
+    settings: SettingsDep,
+    registry: RegistryDep,
+    qdrant: QdrantDep,
+) -> QueryService:
+    """Build the query application service for the request."""
+    return QueryService(session, settings, registry, qdrant)
+
+
 def kb_access_dependency(role: str) -> Callable[..., None]:
     """Build a dependency enforcing ``role`` on the ``kb_id`` path parameter.
 
@@ -162,6 +173,7 @@ ArqPoolDep = Annotated[ArqRedis, Depends(get_arq_pool)]
 JobQueueDep = Annotated[JobQueue, Depends(get_job_queue)]
 KBServiceDep = Annotated[KBService, Depends(get_kb_service)]
 DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
+QueryServiceDep = Annotated[QueryService, Depends(get_query_service)]
 
 #: Permission to read a KB (list/get/config).
 require_viewer = kb_access_dependency("viewer")

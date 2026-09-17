@@ -10,7 +10,7 @@ from fastapi import FastAPI
 
 from app import __version__
 from app.api.errors import register_error_handlers
-from app.api.routers import config, documents, health, jobs, kbs
+from app.api.routers import config, documents, health, jobs, kbs, query
 from app.core.logging import setup_logging
 from app.core.security import build_identity_provider
 from app.core.settings import Settings, get_settings
@@ -46,4 +46,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(config.router)
     app.include_router(documents.router)
     app.include_router(jobs.router)
+    app.include_router(query.router)
     return app

@@ -19,6 +19,7 @@ from app.domain.models import Message
 from app.main import create_app
 from app.persistence.file_storage import FileStorage
 from app.persistence.models import Base
+from app.persistence.qdrant_store import SearchHit
 from app.providers.registry import ProviderBundle, ProviderRegistry
 
 
@@ -38,8 +39,13 @@ class StubEmbedder:
 
 
 class StubChat:
+    def __init__(self, answer: str = "stub answer") -> None:
+        self.answer = answer
+        self.calls: list[tuple[list[Message], str, dict[str, object]]] = []
+
     def chat(self, messages: list[Message], model: str, **opts: object) -> str:
-        return "stub answer"
+        self.calls.append((messages, model, dict(opts)))
+        return self.answer
 
 
 class StubVision:
@@ -83,6 +89,9 @@ class FakeQdrantStore:
         self.points: dict[tuple[str, str], dict[str, Any]] = {}
         self.upserts: list[tuple[str, list[str], list[list[float]], list[dict[str, Any]]]] = []
         self.deletes: list[tuple[str, str]] = []
+        self.search_calls: list[tuple[str, list[float], int]] = []
+        self.search_hits: list[SearchHit] = []
+        self.count_override: int | None = None
 
     def create_collection(self, kb_id: Any, vector_size: int) -> None:
         self.collections[str(kb_id)] = vector_size
@@ -125,6 +134,17 @@ class FakeQdrantStore:
             for (name, _), point in self.points.items()
             if name == str(kb_id) and point["payload"].get("doc_id") == str(doc_id)
         ]
+
+    def search(self, kb_id: Any, vector: list[float], limit: int) -> list[SearchHit]:
+        """Record the search and return the queued hits, capped at ``limit``."""
+        self.search_calls.append((str(kb_id), list(vector), limit))
+        return list(self.search_hits[:limit])
+
+    def count(self, kb_id: Any) -> int:
+        """Return the queued count, or the number of stored points for ``kb_id``."""
+        if self.count_override is not None:
+            return self.count_override
+        return sum(1 for name, _ in self.points if name == str(kb_id))
 
 
 class FakeJobQueue:
