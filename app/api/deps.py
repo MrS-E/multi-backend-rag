@@ -12,15 +12,18 @@ import uuid
 from collections.abc import Callable, Iterator
 from typing import Annotated
 
-from fastapi import Depends, Query, Request
+from arq.connections import ArqRedis
+from fastapi import Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.broker import JobQueue
 from app.core.security import Principal, get_principal, require_kb_access
 from app.core.settings import Settings
 from app.persistence.db import SessionLocal
 from app.persistence.file_storage import FileStorage
 from app.persistence.qdrant_store import QdrantStore
 from app.providers.registry import ProviderRegistry, get_registry
+from app.services.document_service import DocumentService
 from app.services.kb_service import KBService
 
 
@@ -81,6 +84,39 @@ def get_kb_service(
     return KBService(session, settings, registry, qdrant, storage)
 
 
+def get_arq_pool(request: Request) -> ArqRedis:
+    """Return the app-scoped arq pool created at startup.
+
+    Raises ``503`` when the pool is unavailable (Redis down at startup), so job
+    enqueuing and status lookups fail with a clear service error.
+    """
+    pool: ArqRedis | None = getattr(request.app.state, "arq_pool", None)
+    if pool is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="job broker unavailable",
+        )
+    return pool
+
+
+def get_job_queue(request: Request) -> JobQueue:
+    """Return the app-scoped job queue, wrapping the arq pool on first use."""
+    queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
+    if queue is None:
+        queue = JobQueue(get_arq_pool(request))
+        request.app.state.job_queue = queue
+    return queue
+
+
+def get_document_service(
+    session: SessionDep,
+    storage: FileStorageDep,
+    queue: JobQueueDep,
+) -> DocumentService:
+    """Build the document application service for the request."""
+    return DocumentService(session, storage, queue)
+
+
 def kb_access_dependency(role: str) -> Callable[..., None]:
     """Build a dependency enforcing ``role`` on the ``kb_id`` path parameter.
 
@@ -122,7 +158,10 @@ PrincipalDep = Annotated[Principal, Depends(get_principal)]
 RegistryDep = Annotated[ProviderRegistry, Depends(get_provider_registry)]
 QdrantDep = Annotated[QdrantStore, Depends(get_qdrant_store)]
 FileStorageDep = Annotated[FileStorage, Depends(get_file_storage)]
+ArqPoolDep = Annotated[ArqRedis, Depends(get_arq_pool)]
+JobQueueDep = Annotated[JobQueue, Depends(get_job_queue)]
 KBServiceDep = Annotated[KBService, Depends(get_kb_service)]
+DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
 
 #: Permission to read a KB (list/get/config).
 require_viewer = kb_access_dependency("viewer")

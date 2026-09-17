@@ -17,6 +17,11 @@ KB_STATUS_ACTIVE = "active"
 KB_STATUS_REINDEX_REQUIRED = "reindex_required"
 KB_STATUS_COLLECTION_PENDING = "collection_pending"
 
+#: Document ingestion statuses persisted on the ``documents`` row.
+DOC_STATUS_PENDING = "pending"
+DOC_STATUS_INDEXED = "indexed"
+DOC_STATUS_FAILED = "failed"
+
 
 class Message(TypedDict):
     """A single chat message handed to a :class:`ChatProvider`."""
