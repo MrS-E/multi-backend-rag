@@ -1,7 +1,7 @@
 """Shared converter result types.
 
 Every converter returns a :class:`ConvertedDocument`: the extracted text plus any
-images found along the way. Downstream stages (caption → sanitize → chunk →
+images found along the way. Downstream stages (caption → chunk →
 embed → index) work on this uniform shape regardless of the source format.
 """
 

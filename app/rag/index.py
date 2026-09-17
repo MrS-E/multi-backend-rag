@@ -1,4 +1,4 @@
-"""Indexing stage: upsert sanitized chunks into the KB's Qdrant collection.
+"""Indexing stage: upsert chunks into the KB's Qdrant collection.
 
 Owns the Qdrant payload contract from the plan:
 ``{kb_id, doc_id, source_id, uri, kind, chunk_index, content_hash, text}``.

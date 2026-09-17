@@ -1,7 +1,11 @@
 """Content sanitization for injection-safe prompt assembly.
 
+Applied at **prompt-assembly time**, not at ingest: ingested content stays
+faithful in storage and Qdrant payloads (plan Key Decision 8), and the escaping
+below happens only when a chunk is wrapped for the model.
+
 Two independent concerns, both applied to every text that may end up inside a
-``<![CDATA[...]]>`` envelope (plan Key Decision 8):
+``<![CDATA[...]]>`` envelope:
 
 * **invisible characters** — bidi controls and zero-width characters are stripped
   so they cannot smuggle or reorder text past a reviewer;

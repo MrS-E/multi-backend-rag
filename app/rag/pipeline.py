@@ -1,4 +1,4 @@
-"""Ingestion pipeline: convert → caption → sanitize → chunk → embed → index.
+"""Ingestion pipeline: convert → caption → chunk → embed → index.
 
 One document event is processed end to end, with hash-based change detection so
 re-uploading unchanged content never re-embeds:
@@ -38,7 +38,6 @@ from app.rag.convert import convert_document
 from app.rag.convert.base import KIND_IMAGE_CAPTION, ConvertedDocument, ExtractedImage
 from app.rag.embed import embed_texts
 from app.rag.index import IndexedChunk, delete_document, index_chunks
-from app.rag.sanitize import sanitize
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +120,9 @@ class IngestionPipeline:
             and existing.status == DOC_STATUS_INDEXED
             and existing.content_hash == content_hash
         ):
+            # Content defines a document's identity: identical bytes under a new
+            # filename keep the original ``uri`` rather than repointing the row,
+            # so a rename alone never triggers a re-embed.
             logger.info(
                 "skipping unchanged document",
                 extra={"kb_id": str(kb_id), "doc_id": event.doc_id},
@@ -130,7 +132,7 @@ class IngestionPipeline:
         old_raw_path = existing.raw_path if existing is not None else None
         raw_path = self._store(event, kb_id, data)
         if existing is not None and existing.content_hash != content_hash:
-            delete_document(kb_id, event.doc_id, self._qdrant)
+            self._delete_vectors(kb_id, event.doc_id)
 
         try:
             indexed, vectors = self._prepare(kb_id, event, data, content_hash, config)
@@ -138,6 +140,7 @@ class IngestionPipeline:
             index_chunks(kb_id, event.doc_id, indexed, vectors, self._qdrant)
         except Exception:
             self._update_row(kb_id, doc_uuid, event, raw_path, content_hash, DOC_STATUS_FAILED)
+            self._remove_replaced_file(existing, old_raw_path, raw_path)
             raise
 
         self._update_row(kb_id, doc_uuid, event, raw_path, content_hash, DOC_STATUS_INDEXED)
@@ -147,7 +150,7 @@ class IngestionPipeline:
         """Remove a document's vectors, stored file and DB row."""
         self._require_kb(kb_id)
         doc_uuid = document_uuid(event.doc_id)
-        delete_document(kb_id, event.doc_id, self._qdrant)
+        self._delete_vectors(kb_id, event.doc_id)
 
         document = self._session.get(Document, doc_uuid)
         if document is None:
@@ -203,6 +206,12 @@ class IngestionPipeline:
                 },
             )
 
+    def _delete_vectors(self, kb_id: uuid.UUID, doc_id: str) -> None:
+        """Delete a document's vectors, no-op when its KB has no collection yet."""
+        if not self._qdrant.collection_exists(kb_id):
+            return
+        delete_document(kb_id, doc_id, self._qdrant)
+
     def _prepare(
         self,
         kb_id: uuid.UUID,
@@ -211,7 +220,11 @@ class IngestionPipeline:
         content_hash: str,
         config: EffectiveConfig,
     ) -> tuple[list[IndexedChunk], list[list[float]]]:
-        """Convert, caption, sanitize and chunk the document, then embed every chunk."""
+        """Convert, caption and chunk the document, then embed every chunk.
+
+        Content is stored faithfully: sanitization happens at prompt-assembly
+        time (plan Key Decision 8), not during ingest.
+        """
         converted = convert_document(data, event.uri, resolve_image=self._resolve_image)
         items = self._collect_chunks(converted, config, event)
 
@@ -236,9 +249,8 @@ class IngestionPipeline:
     ) -> list[tuple[Chunk, str]]:
         """Build the (chunk, uri) pairs for the text body and every captioned image."""
         items: list[tuple[Chunk, str]] = []
-        text = sanitize(converted.text)
         for chunk in split_into_chunks(
-            text, config.chunk_size, config.chunk_overlap, converted.kind
+            converted.text, config.chunk_size, config.chunk_overlap, converted.kind
         ):
             items.append((chunk, event.uri))
 
@@ -249,7 +261,7 @@ class IngestionPipeline:
         vision = self._registry.get_vision(config.vision_model)
         for index, image in enumerate(converted.images):
             caption = caption_image(image.data, vision, vision_model)
-            body = sanitize(image_chunk_text(image, caption))
+            body = image_chunk_text(image, caption)
             items.append(
                 (
                     Chunk(text=body, kind=KIND_IMAGE_CAPTION, chunk_index=index),
