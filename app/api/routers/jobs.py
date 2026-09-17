@@ -33,7 +33,7 @@ async def get_job_status(job_id: str, pool: ArqPoolDep) -> JobStatusOut:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
 
     if job_status is not JobStatus.complete:
-        return JobStatusOut(status=_STATUS_MAP[job_status])
+        return JobStatusOut(status=_STATUS_MAP.get(job_status, "failed"))
 
     result = await job.result_info()
     if result is not None and not result.success:

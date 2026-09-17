@@ -96,6 +96,22 @@ def test_given_oversize_upload_when_uploading_then_413(
     assert response.status_code == 413
 
 
+def test_given_over_limit_content_length_when_uploading_then_413(
+    client: TestClient, app: FastAPI
+) -> None:
+    app.state.settings.server.max_upload_mb = 1
+    kb_id = _create_kb(client)
+
+    response = client.post(
+        f"/kbs/{kb_id}/documents",
+        files={"file": ("notes.md", _MARKDOWN, "text/markdown")},
+        headers={"Content-Length": str(2 * 1024 * 1024)},
+    )
+
+    assert response.status_code == 413
+    assert client.get(f"/kbs/{kb_id}/documents").json() == []
+
+
 def test_given_valid_markdown_when_uploading_then_202_and_enqueued(
     client: TestClient, job_queue: FakeJobQueue
 ) -> None:

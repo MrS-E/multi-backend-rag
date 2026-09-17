@@ -105,6 +105,17 @@ def test_given_unknown_job_when_getting_then_404(
     assert response.json()["detail"] == "job not found"
 
 
+def test_given_unmapped_arq_status_when_getting_then_failed(
+    client: TestClient, fake_job: type[_FakeJob]
+) -> None:
+    fake_job.status_value = "future-status"  # type: ignore[assignment]
+
+    response = client.get("/jobs/job-1")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "failed", "error": None}
+
+
 def test_given_complete_job_when_getting_then_done(
     client: TestClient, fake_job: type[_FakeJob]
 ) -> None:

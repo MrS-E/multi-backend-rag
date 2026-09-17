@@ -49,21 +49,22 @@ async def ingest_events(ctx: dict[str, Any], kb_id: str, events: list[dict[str, 
     recovers instead of failing permanently.
     """
     parsed = [event_from_payload(payload) for payload in events]
-    pipeline = IngestionPipeline(
-        session=SessionLocal(),
-        settings=get_settings(),
-        registry=get_registry(),
-        qdrant=QdrantStore(),
-        storage=FileStorage(),
-    )
     job_try = int(ctx.get("job_try", 1))
-    try:
-        pipeline.process_events(uuid.UUID(kb_id), parsed)
-    except ProviderError as exc:
-        delay = retry_delay(job_try)
-        logger.warning(
-            "provider error during ingestion; retrying",
-            extra={"kb_id": kb_id, "job_try": job_try, "defer_s": delay, "error": str(exc)},
+    with SessionLocal() as session:
+        pipeline = IngestionPipeline(
+            session=session,
+            settings=get_settings(),
+            registry=get_registry(),
+            qdrant=QdrantStore(),
+            storage=FileStorage(),
         )
-        raise Retry(defer=delay) from exc
+        try:
+            pipeline.process_events(uuid.UUID(kb_id), parsed)
+        except ProviderError as exc:
+            delay = retry_delay(job_try)
+            logger.warning(
+                "provider error during ingestion; retrying",
+                extra={"kb_id": kb_id, "job_try": job_try, "defer_s": delay, "error": str(exc)},
+            )
+            raise Retry(defer=delay) from exc
     return len(parsed)

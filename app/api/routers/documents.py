@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 
 from app.api.deps import (
     DocumentServiceDep,
@@ -22,10 +22,46 @@ router = APIRouter(prefix="/kbs/{kb_id}/documents", tags=["documents"])
 
 _MEGABYTE = 1024 * 1024
 
+#: Size of the chunks an upload body is read in, so an over-limit body aborts early.
+_READ_CHUNK_BYTES = _MEGABYTE
+
 
 def _max_upload_bytes(settings: Settings) -> int:
     """Return the configured upload limit in bytes."""
     return settings.server.max_upload_mb * _MEGABYTE
+
+
+def _content_length_exceeds_limit(request: Request, max_upload_bytes: int) -> bool:
+    """Return whether the request's declared ``Content-Length`` is over the limit."""
+    raw = request.headers.get("content-length")
+    if raw is None:
+        return False
+    try:
+        return int(raw) > max_upload_bytes
+    except ValueError:
+        return False
+
+
+def _too_large(max_upload_bytes: int) -> HTTPException:
+    """Build the ``413`` raised for an over-limit upload."""
+    return HTTPException(
+        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+        detail=f"upload exceeds the {max_upload_bytes // _MEGABYTE} MB limit",
+    )
+
+
+async def _read_upload(file: UploadFile, max_upload_bytes: int) -> bytes:
+    """Read an upload in bounded chunks, aborting with ``413`` as soon as it is too big."""
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await file.read(_READ_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > max_upload_bytes:
+            raise _too_large(max_upload_bytes)
+        chunks.append(chunk)
 
 
 @router.post(
@@ -35,6 +71,7 @@ def _max_upload_bytes(settings: Settings) -> int:
     dependencies=[Depends(require_editor)],
 )
 async def upload_document(
+    request: Request,
     kb_id: uuid.UUID,
     service: DocumentServiceDep,
     kb_service: KBServiceDep,
@@ -48,19 +85,18 @@ async def upload_document(
     """
     kb_service.get_kb(kb_id)
     uri = file.filename or ""
-    data = await file.read()
+    max_upload_bytes = _max_upload_bytes(settings)
+    if _content_length_exceeds_limit(request, max_upload_bytes):
+        raise _too_large(max_upload_bytes)
+    data = await _read_upload(file, max_upload_bytes)
     try:
-        _, job_id = await service.upload(
-            kb_id, uri, data, max_upload_bytes=_max_upload_bytes(settings)
-        )
+        _, job_id = await service.upload(kb_id, uri, data, max_upload_bytes=max_upload_bytes)
     except UnsupportedFileTypeError as exc:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)
         ) from exc
     except DocumentTooLargeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)
-        ) from exc
+        raise _too_large(max_upload_bytes) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
