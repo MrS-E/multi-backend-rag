@@ -58,6 +58,19 @@ class ProviderRegistry:
         """Register a ready-made provider bundle under ``name``."""
         self._providers[name] = bundle
 
+    def known_providers(self) -> set[str]:
+        """Return the provider prefixes this registry can resolve."""
+        return {"ollama", "openai"} | set(self._providers)
+
+    def validate_model_str(self, model_str: str) -> None:
+        """Raise :class:`UnknownProviderError` unless ``model_str`` names a known provider."""
+        provider, _ = parse_model_str(model_str)
+        if provider not in self.known_providers():
+            raise UnknownProviderError(
+                f"unknown provider prefix {provider!r}; known providers: "
+                f"{sorted(self.known_providers())}"
+            )
+
     def _bundle(self, provider: str) -> ProviderBundle:
         bundle = self._providers.get(provider)
         if bundle is not None:
@@ -69,7 +82,7 @@ class ProviderRegistry:
         else:
             raise UnknownProviderError(
                 f"unknown provider prefix {provider!r}; known providers: "
-                f"{sorted({'ollama', 'openai'} | set(self._providers))}"
+                f"{sorted(self.known_providers())}"
             )
         bundle = ProviderBundle(embedder=instance, chat=instance, vision=instance)
         self._providers[provider] = bundle

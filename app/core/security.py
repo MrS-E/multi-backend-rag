@@ -58,7 +58,12 @@ class ApiKeyIdentityProvider:
     def authenticate(self, creds: RequestCredentials) -> Principal | None:
         """Return a principal when the bearer token matches, else ``None``."""
         token = _extract_bearer_token(creds.authorization)
-        if token is None or not hmac.compare_digest(token, self._api_key):
+        if token is None:
+            return None
+        # Compare bytes: ``hmac.compare_digest`` rejects ``str`` arguments that
+        # contain non-ASCII characters, which would surface as a 500 instead of
+        # a clean 401 for a malformed token.
+        if not hmac.compare_digest(token.encode("utf-8"), self._api_key.encode("utf-8")):
             return None
         return Principal(subject="api-key", groups=())
 

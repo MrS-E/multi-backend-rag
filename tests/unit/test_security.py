@@ -114,6 +114,39 @@ def test_given_none_auth_when_requesting_kbs_then_no_401(client: TestClient) -> 
     assert response.status_code == 200
 
 
+def test_given_kb_scoped_config_request_when_called_then_passes_through_choke_point(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[uuid.UUID | str, str]] = []
+
+    def spy(kb_id: uuid.UUID | str, role: str, principal: Principal | None = None) -> None:
+        calls.append((kb_id, role))
+
+    monkeypatch.setattr("app.api.deps.require_kb_access", spy)
+    kb_id = client.post("/kbs", json={"name": "Docs"}).json()["id"]
+
+    response = client.get("/config/effective", params={"kb_id": kb_id})
+
+    assert response.status_code == 200
+    assert calls == [(uuid.UUID(kb_id), "viewer")]
+
+
+def test_given_global_config_request_when_called_then_no_choke_point(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[uuid.UUID | str, str]] = []
+
+    def spy(kb_id: uuid.UUID | str, role: str, principal: Principal | None = None) -> None:
+        calls.append((kb_id, role))
+
+    monkeypatch.setattr("app.api.deps.require_kb_access", spy)
+
+    response = client.get("/config/effective")
+
+    assert response.status_code == 200
+    assert calls == []
+
+
 def test_given_api_key_auth_when_no_token_then_401(
     monkeypatch: pytest.MonkeyPatch,
     session_factory: sessionmaker[Session],
@@ -140,3 +173,19 @@ def test_given_api_key_auth_when_valid_token_then_200(
         response = client.get("/kbs", headers={"Authorization": "Bearer secret"})
 
     assert response.status_code == 200
+
+
+def test_given_api_key_auth_when_bearer_token_is_non_ascii_then_401(
+    monkeypatch: pytest.MonkeyPatch,
+    session_factory: sessionmaker[Session],
+    tmp_path: object,
+) -> None:
+    monkeypatch.setenv("RAG_API_KEY", "secret")
+    settings = Settings(auth=AuthConfig(provider="api_key", api_key_env="RAG_API_KEY"))
+
+    with _api_key_app(settings, session_factory, tmp_path) as client:
+        response = client.get(
+            "/kbs", headers=[(b"authorization", b"Bearer s\xc3\xa9cret")]
+        )
+
+    assert response.status_code == 401

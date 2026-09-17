@@ -12,7 +12,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from typing import Annotated
 
-from fastapi import Depends, Request
+from fastapi import Depends, Query, Request
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.security import Principal, get_principal, require_kb_access
@@ -98,6 +98,24 @@ def kb_access_dependency(role: str) -> Callable[..., None]:
     return dependency
 
 
+def kb_query_access_dependency(role: str) -> Callable[..., None]:
+    """Build a dependency enforcing ``role`` on the ``kb_id`` query parameter.
+
+    Like :func:`kb_access_dependency`, but for endpoints whose KB reference is a
+    query parameter rather than a path parameter (e.g. ``GET /config/effective``).
+    When ``kb_id`` is omitted the endpoint is not KB-scoped, so no check runs.
+    """
+
+    def dependency(
+        principal: Annotated[Principal, Depends(get_principal)],
+        kb_id: Annotated[uuid.UUID | None, Query()] = None,
+    ) -> None:
+        if kb_id is not None:
+            require_kb_access(kb_id, role, principal)
+
+    return dependency
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 SessionDep = Annotated[Session, Depends(get_session)]
 PrincipalDep = Annotated[Principal, Depends(get_principal)]
@@ -108,6 +126,8 @@ KBServiceDep = Annotated[KBService, Depends(get_kb_service)]
 
 #: Permission to read a KB (list/get/config).
 require_viewer = kb_access_dependency("viewer")
+#: Permission to read a KB referenced by query parameter (``GET /config/effective``).
+require_query_viewer = kb_query_access_dependency("viewer")
 #: Permission to modify a KB's content (documents, sources, events).
 require_editor = kb_access_dependency("editor")
 #: Permission to modify KB configuration or delete it.

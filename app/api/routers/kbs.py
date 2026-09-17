@@ -4,13 +4,23 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from app.api.deps import KBServiceDep, PrincipalDep, require_owner, require_viewer
-from app.api.schemas.kbs import KBCreate, KBOut, KBUpdate
+from app.api.deps import (
+    KBServiceDep,
+    PrincipalDep,
+    RegistryDep,
+    require_owner,
+    require_viewer,
+)
+from app.api.schemas.kbs import KBCreate, KBOut, KBOverrides, KBUpdate
 from app.domain.models import SYSTEM_SUBJECT
+from app.providers.registry import ProviderRegistry, UnknownProviderError
 
 router = APIRouter(prefix="/kbs", tags=["kbs"])
+
+#: Override fields that hold a ``<provider>/<model>`` string.
+_MODEL_OVERRIDE_FIELDS = ("embed_model", "chat_model", "vision_model")
 
 
 def _owner_id(principal_subject: str) -> str | None:
@@ -18,13 +28,31 @@ def _owner_id(principal_subject: str) -> str | None:
     return None if principal_subject == SYSTEM_SUBJECT else principal_subject
 
 
+def _validate_model_overrides(overrides: KBOverrides | None, registry: ProviderRegistry) -> None:
+    """Reject model overrides that don't name a known provider prefix (``422``)."""
+    if overrides is None:
+        return
+    for field in _MODEL_OVERRIDE_FIELDS:
+        model_str = getattr(overrides, field)
+        if model_str is None:
+            continue
+        try:
+            registry.validate_model_str(model_str)
+        except UnknownProviderError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            ) from exc
+
+
 @router.post("", response_model=KBOut, status_code=status.HTTP_201_CREATED)
 def create_kb(
     payload: KBCreate,
     service: KBServiceDep,
+    registry: RegistryDep,
     principal: PrincipalDep,
 ) -> KBOut:
     """Create a knowledge base and provision its Qdrant collection."""
+    _validate_model_overrides(payload.overrides, registry)
     overrides = payload.overrides.model_dump() if payload.overrides is not None else None
     kb = service.create_kb(
         name=payload.name,
@@ -48,8 +76,14 @@ def get_kb(kb_id: uuid.UUID, service: KBServiceDep) -> KBOut:
 
 
 @router.patch("/{kb_id}", response_model=KBOut, dependencies=[Depends(require_owner)])
-def update_kb(kb_id: uuid.UUID, payload: KBUpdate, service: KBServiceDep) -> KBOut:
+def update_kb(
+    kb_id: uuid.UUID,
+    payload: KBUpdate,
+    service: KBServiceDep,
+    registry: RegistryDep,
+) -> KBOut:
     """Partially update a knowledge base (including model overrides)."""
+    _validate_model_overrides(payload.overrides, registry)
     overrides = (
         payload.overrides.model_dump(exclude_unset=True) if payload.overrides is not None else None
     )

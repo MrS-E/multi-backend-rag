@@ -134,6 +134,64 @@ def test_given_kb_when_patching_null_override_then_cleared(client: TestClient) -
     assert response.json()["overrides"] == {}
 
 
+def test_given_unknown_provider_prefix_when_patching_then_422(client: TestClient) -> None:
+    kb_id = client.post("/kbs", json={"name": "Docs"}).json()["id"]
+
+    response = client.patch(f"/kbs/{kb_id}", json={"overrides": {"embed_model": "bogus"}})
+
+    assert response.status_code == 422
+
+
+def test_given_unprefixed_model_when_patching_then_422(client: TestClient) -> None:
+    kb_id = client.post("/kbs", json={"name": "Docs"}).json()["id"]
+
+    response = client.patch(f"/kbs/{kb_id}", json={"overrides": {"chat_model": "gpt-4o"}})
+
+    assert response.status_code == 422
+
+
+def test_given_invalid_vision_model_when_patching_then_422(client: TestClient) -> None:
+    kb_id = client.post("/kbs", json={"name": "Docs"}).json()["id"]
+
+    response = client.patch(f"/kbs/{kb_id}", json={"overrides": {"vision_model": "anthropic/x"}})
+
+    assert response.status_code == 422
+
+
+def test_given_valid_model_overrides_when_patching_then_200(client: TestClient) -> None:
+    kb_id = client.post("/kbs", json={"name": "Docs"}).json()["id"]
+
+    response = client.patch(
+        f"/kbs/{kb_id}",
+        json={
+            "overrides": {
+                "embed_model": "openai/text-embedding-3-large",
+                "chat_model": "ollama/llama3.2",
+                "vision_model": "ollama/llama3.2-vision",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["overrides"]["chat_model"] == "ollama/llama3.2"
+
+
+def test_given_invalid_model_override_when_creating_then_422(client: TestClient) -> None:
+    response = client.post("/kbs", json={"name": "Docs", "overrides": {"embed_model": "bogus"}})
+
+    assert response.status_code == 422
+
+
+def test_given_invalid_model_override_when_patching_then_status_unchanged(
+    client: TestClient,
+) -> None:
+    kb_id = client.post("/kbs", json={"name": "Docs"}).json()["id"]
+
+    client.patch(f"/kbs/{kb_id}", json={"overrides": {"embed_model": "bogus"}})
+
+    assert client.get(f"/kbs/{kb_id}").json()["status"] == "active"
+
+
 def test_given_kb_when_changing_embed_model_override_then_reindex_required(
     client: TestClient,
 ) -> None:

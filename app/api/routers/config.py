@@ -5,18 +5,21 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
-from app.api.deps import KBServiceDep, PrincipalDep
+from app.api.deps import KBServiceDep, require_query_viewer
 from app.api.schemas.kbs import EffectiveConfigOut
 
 router = APIRouter(prefix="/config", tags=["config"])
 
 
-@router.get("/effective", response_model=EffectiveConfigOut)
+@router.get(
+    "/effective",
+    response_model=EffectiveConfigOut,
+    dependencies=[Depends(require_query_viewer)],
+)
 def get_effective_config(
     service: KBServiceDep,
-    principal: PrincipalDep,
     kb_id: Annotated[
         uuid.UUID | None, Query(description="KB to resolve; omit for globals")
     ] = None,
