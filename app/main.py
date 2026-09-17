@@ -9,8 +9,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app import __version__
-from app.api.routers import health
+from app.api.errors import register_error_handlers
+from app.api.routers import config, health, kbs
 from app.core.logging import setup_logging
+from app.core.security import build_identity_provider
 from app.core.settings import Settings, get_settings
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Multi-BackendRag", version=__version__, lifespan=lifespan)
     app.state.settings = settings
+    # Fail fast at startup if auth is misconfigured (e.g. api_key provider with
+    # an unset env var); the provider is then reused for every request.
+    app.state.identity_provider = build_identity_provider(settings)
 
+    register_error_handlers(app)
     app.include_router(health.router)
+    app.include_router(kbs.router)
+    app.include_router(config.router)
     return app
