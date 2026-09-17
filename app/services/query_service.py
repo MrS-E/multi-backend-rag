@@ -10,7 +10,8 @@ Two guard rails live here:
 * a KB flagged ``reindex_required`` cannot be queried (its vectors are about to
   be rebuilt) → :class:`ConflictError` → ``409``;
 * a KB with no indexed content returns a graceful "no documents indexed yet"
-  answer without embedding or calling the chat provider.
+  answer without calling the chat provider: retrieval yields no chunks (missing
+  collection → ``[]``) and generation is skipped.
 """
 
 from __future__ import annotations
@@ -80,9 +81,6 @@ class QueryService:
             )
 
         config = resolve_effective_config(self._settings.defaults, kb.overrides)
-        if not self._has_content(kb_id):
-            return QueryResult(answer=NO_DOCUMENTS_ANSWER, sources=[])
-
         chunks = retrieve_chunks(
             kb_id, question, config, self._registry, self._qdrant, top_k=top_k
         )
@@ -91,9 +89,3 @@ class QueryService:
 
         generated = generate_answer(question, chunks, config, self._registry)
         return QueryResult(answer=generated.answer, sources=generated.sources)
-
-    def _has_content(self, kb_id: uuid.UUID) -> bool:
-        """Return whether the KB's collection exists and holds at least one point."""
-        if not self._qdrant.collection_exists(kb_id):
-            return False
-        return self._qdrant.count(kb_id) > 0

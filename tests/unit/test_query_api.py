@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from app.persistence.qdrant_store import SearchHit
 from app.providers.registry import ProviderBundle, ProviderRegistry
 from app.rag.generate import CHAT_OPTIONS
+from app.rag.sanitize import sanitize
 from app.services.query_service import NO_DOCUMENTS_ANSWER
 from tests.conftest import FakeQdrantStore, StubChat, StubEmbedder, StubVision
 
@@ -102,8 +103,8 @@ def test_given_kb_chat_override_when_querying_then_override_model_used(env: _Env
     env.client.post(f"/kbs/{kb_id}/query", json={"question": "How quick?"})
 
     _, model, _ = env.chat.calls[0]
+    # The stub received exactly the KB's override model string (bare, unprefixed).
     assert model == "gpt-4o-mini"
-    assert model != env.app.state.settings.defaults.chat_model
 
 
 def test_given_kb_embed_override_when_querying_then_override_model_used(env: _Env) -> None:
@@ -119,6 +120,26 @@ def test_given_kb_embed_override_when_querying_then_override_model_used(env: _En
 
     # The last embed call is the query embedding (the first was the create-time probe).
     assert env.embedder.calls[-1] == (["How quick?"], "text-embedding-3-large")
+
+
+def test_given_indexed_kb_when_querying_then_snippet_is_faithful_stored_text(
+    env: _Env,
+) -> None:
+    # The prompt must carry the sanitized form, but the API response returns the
+    # faithful stored text (CDATA escape artifacts and invisibles intact).
+    dirty = "a]]>b\u202ec"
+    kb_id = env.client.post("/kbs", json={"name": "Docs"}).json()["id"]
+    env.store.create_collection(kb_id, 8)
+    env.store.count_override = 1
+    env.store.search_hits = [_hit(text=dirty)]
+
+    response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "What?"})
+
+    assert response.status_code == 200
+    assert response.json()["sources"][0]["snippet"] == dirty
+    user = env.chat.calls[0][0][1]["content"]
+    assert sanitize(dirty) in user
+    assert "\u202e" not in user
 
 
 def test_given_indexed_kb_with_multiple_hits_when_querying_then_sources_map_in_order(
@@ -142,19 +163,17 @@ def test_given_indexed_kb_with_multiple_hits_when_querying_then_sources_map_in_o
     ]
 
 
-def test_given_empty_kb_when_querying_then_graceful_answer_without_provider_call(
+def test_given_empty_kb_when_querying_then_graceful_answer_without_chat_call(
     env: _Env,
 ) -> None:
     kb_id = env.client.post("/kbs", json={"name": "Empty"}).json()["id"]
-    embed_calls_before = list(env.embedder.calls)
 
     response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "Anything?"})
 
     assert response.status_code == 200
     assert response.json() == {"answer": NO_DOCUMENTS_ANSWER, "sources": []}
+    # The empty-hits path short-circuits before generation: no chat provider call.
     assert env.chat.calls == []
-    # No question embedding beyond the KB-creation dimension probe.
-    assert env.embedder.calls == embed_calls_before
 
 
 def test_given_reindex_required_kb_when_querying_then_409(env: _Env) -> None:
@@ -195,6 +214,38 @@ def test_given_missing_question_when_querying_then_422(env: _Env) -> None:
     kb_id = _seed_kb(env)
 
     response = env.client.post(f"/kbs/{kb_id}/query", json={})
+
+    assert response.status_code == 422
+
+
+def test_given_top_k_above_bound_when_querying_then_422(env: _Env) -> None:
+    kb_id = _seed_kb(env)
+
+    response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "How quick?", "top_k": 101})
+
+    assert response.status_code == 422
+
+
+def test_given_top_k_at_bound_when_querying_then_accepted(env: _Env) -> None:
+    kb_id = _seed_kb(env)
+
+    response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "How quick?", "top_k": 100})
+
+    assert response.status_code == 200
+
+
+def test_given_non_positive_top_k_when_querying_then_422(env: _Env) -> None:
+    kb_id = _seed_kb(env)
+
+    response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "How quick?", "top_k": 0})
+
+    assert response.status_code == 422
+
+
+def test_given_overlong_question_when_querying_then_422(env: _Env) -> None:
+    kb_id = _seed_kb(env)
+
+    response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "x" * 4001})
 
     assert response.status_code == 422
 

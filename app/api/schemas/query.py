@@ -8,8 +8,8 @@ from pydantic import BaseModel, Field
 class QueryRequest(BaseModel):
     """Request body for ``POST /kbs/{id}/query``."""
 
-    question: str = Field(min_length=1)
-    top_k: int | None = Field(default=None, gt=0)
+    question: str = Field(min_length=1, max_length=4000)
+    top_k: int | None = Field(default=None, gt=0, le=100)
 
 
 class SourceOut(BaseModel):

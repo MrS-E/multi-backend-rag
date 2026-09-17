@@ -1,9 +1,9 @@
 """Generation stage: call the KB's effective chat model on the assembled prompt.
 
 The chat options are ported verbatim from the PoC (``temperature`` 0.2,
-``num_ctx`` 4096, ``top_p`` 0.9). The returned :class:`Source` values are the
-sanitized snippets the prompt actually carried, so the API can show the client
-which documents backed the answer without re-reading Qdrant.
+``num_ctx`` 4096, ``top_p`` 0.9). The returned :class:`Source` values carry the
+*faithful* stored excerpt (not the sanitized text the prompt carried), so the
+API can show the client what the document really says without re-reading Qdrant.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ CHAT_OPTIONS: dict[str, object] = {
 
 @dataclass(frozen=True, slots=True)
 class Source:
-    """A cited source: the document URI, its score and a sanitized excerpt."""
+    """A cited source: the document URI, its score and a faithful excerpt."""
 
     uri: str
     score: float
@@ -53,7 +53,7 @@ def generate_answer(
     provider = registry.get_chat(config.chat_model)
     answer = provider.chat(assembled.messages, chat_model, **CHAT_OPTIONS)
     sources = [
-        Source(uri=citation.uri, score=citation.score, snippet=citation.snippet)
+        Source(uri=citation.uri, score=citation.score, snippet=citation.faithful_snippet)
         for citation in assembled.citations
     ]
     return GeneratedAnswer(answer=answer, sources=sources)

@@ -19,6 +19,7 @@ answer.
 
 from __future__ import annotations
 
+import html
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -49,12 +50,18 @@ SNIPPET_MAX_CHARS = 300
 
 @dataclass(frozen=True, slots=True)
 class Citation:
-    """One document block that made it into the prompt, with its citation number."""
+    """One document block that made it into the prompt, with its citation number.
+
+    ``snippet`` is the *sanitized* text the prompt actually carried;
+    ``faithful_snippet`` is the same excerpt taken from the stored chunk text,
+    so the API can return what the document really says.
+    """
 
     number: int
     uri: str
     score: float
     snippet: str
+    faithful_snippet: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,8 +80,15 @@ def _truncate(text: str, max_chars: int = SNIPPET_MAX_CHARS) -> str:
 
 
 def document_block(number: int, uri: str, sanitized_text: str) -> str:
-    """Wrap one sanitized chunk in its ``<document>`` CDATA envelope."""
-    return f'<document id="{number}" source="{uri}"><![CDATA[{sanitized_text}]]></document>'
+    """Wrap one sanitized chunk in its ``<document>`` CDATA envelope.
+
+    The ``uri`` is XML-escaped (``&``, ``<``, ``>``, ``"``) before it is placed
+    in the ``source`` attribute: a URI is attacker-influenced metadata, and an
+    unescaped quote would let it close the attribute and forge a second
+    ``<document>`` element outside the CDATA body.
+    """
+    source = html.escape(uri, quote=True)
+    return f'<document id="{number}" source="{source}"><![CDATA[{sanitized_text}]]></document>'
 
 
 def assemble_documents(
@@ -85,7 +99,9 @@ def assemble_documents(
 
     Returns the joined blocks and the citations for the blocks that fit. Each
     chunk is sanitized here, exactly once, before being placed inside its
-    envelope; citation numbers run ``1..n`` over the included blocks.
+    envelope; citation numbers run ``1..n`` over the included blocks. The
+    citation carries both the sanitized snippet (what the prompt shows the
+    model) and the faithful snippet (what storage holds, for the API client).
     """
     blocks: list[str] = []
     citations: list[Citation] = []
@@ -102,6 +118,7 @@ def assemble_documents(
                 uri=chunk.uri,
                 score=chunk.score,
                 snippet=_truncate(sanitized),
+                faithful_snippet=_truncate(chunk.text),
             )
         )
         total += len(block)
