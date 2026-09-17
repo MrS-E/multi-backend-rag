@@ -127,6 +127,7 @@ class IngestionPipeline:
             )
             return
 
+        old_raw_path = existing.raw_path if existing is not None else None
         raw_path = self._store(event, kb_id, data)
         if existing is not None and existing.content_hash != content_hash:
             delete_document(kb_id, event.doc_id, self._qdrant)
@@ -140,7 +141,7 @@ class IngestionPipeline:
             raise
 
         self._update_row(kb_id, doc_uuid, event, raw_path, content_hash, DOC_STATUS_INDEXED)
-        self._remove_replaced_file(existing, raw_path)
+        self._remove_replaced_file(existing, old_raw_path, raw_path)
 
     def process_delete(self, kb_id: uuid.UUID, event: DeleteEvent) -> None:
         """Remove a document's vectors, stored file and DB row."""
@@ -184,18 +185,20 @@ class IngestionPipeline:
         rel_path, _ = self._storage.save(kb_id, data)
         return rel_path
 
-    def _remove_replaced_file(self, existing: Document | None, raw_path: str) -> None:
+    def _remove_replaced_file(
+        self, existing: Document | None, old_raw_path: str | None, raw_path: str
+    ) -> None:
         """Delete the previous raw file when a changed document moved to a new path."""
-        if existing is None or existing.raw_path == raw_path:
+        if existing is None or old_raw_path is None or old_raw_path == raw_path:
             return
         try:
-            self._storage.delete(existing.raw_path)
+            self._storage.delete(old_raw_path)
         except Exception as exc:  # noqa: BLE001 - best-effort file cleanup
             logger.warning(
                 "failed to delete replaced file",
                 extra={
                     "doc_id": str(existing.id),
-                    "raw_path": existing.raw_path,
+                    "raw_path": old_raw_path,
                     "error": str(exc),
                 },
             )
