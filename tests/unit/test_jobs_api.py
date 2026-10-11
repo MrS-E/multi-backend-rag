@@ -167,3 +167,19 @@ def test_given_no_arq_pool_when_getting_then_503(app: FastAPI) -> None:
         response = test_client.get("/jobs/job-1")
 
     assert response.status_code == 503
+
+
+def test_given_broker_failure_after_startup_when_getting_then_503(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _UnavailableJob(_FakeJob):
+        async def status(self) -> JobStatus:
+            raise ConnectionError("redis went away")
+
+    app.state.arq_pool = object()
+    monkeypatch.setattr(routers.jobs, "Job", _UnavailableJob)
+
+    with TestClient(app) as client:
+        response = client.get("/jobs/job-1")
+
+    assert response.status_code == 503

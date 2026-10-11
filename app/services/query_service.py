@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from app.core.settings import Settings
 from app.domain.config_resolution import resolve_effective_config
 from app.domain.errors import ConflictError, NotFoundError
-from app.domain.models import KB_STATUS_REINDEX_REQUIRED
+from app.domain.models import KB_STATUS_REINDEX_REQUIRED, KB_STATUS_REINDEXING
 from app.persistence.models import KnowledgeBase
 from app.persistence.qdrant_store import QdrantStore
 from app.providers.registry import ProviderRegistry
@@ -75,7 +75,7 @@ class QueryService:
         kb = self._session.get(KnowledgeBase, kb_id)
         if kb is None:
             raise NotFoundError(f"knowledge base {kb_id} not found")
-        if kb.status == KB_STATUS_REINDEX_REQUIRED:
+        if kb.status in {KB_STATUS_REINDEX_REQUIRED, KB_STATUS_REINDEXING}:
             raise ConflictError(
                 f"knowledge base {kb_id} requires reindexing before it can be queried"
             )

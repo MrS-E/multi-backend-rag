@@ -39,9 +39,18 @@ class FileStorage:
         target.write_bytes(data)
         return rel_path, digest
 
-    def read(self, rel_path: str) -> bytes:
-        """Read raw bytes for a stored relative path."""
-        return self._resolve(rel_path).read_bytes()
+    def read(self, rel_path: str, max_bytes: int | None = None) -> bytes:
+        """Read raw bytes for a stored relative path, optionally with a hard bound."""
+        path = self._resolve(rel_path)
+        if max_bytes is None:
+            return path.read_bytes()
+        if path.stat().st_size > max_bytes:
+            raise ValueError("stored event data exceeds the configured upload limit")
+        with path.open("rb") as file:
+            data = file.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("stored event data exceeds the configured upload limit")
+        return data
 
     def delete(self, rel_path: str) -> None:
         """Delete a stored file if present."""

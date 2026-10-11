@@ -9,20 +9,52 @@ events through the ingestion pipeline with the in-memory stores.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from httpx import Response
+from sqlalchemy import select
 
-from app.domain.events import DeleteEvent, UpsertEvent
-from app.persistence.models import Document
+from app.domain.events import DeleteEvent, SourceEvent, UpsertEvent
+from app.persistence.file_storage import FileStorage
+from app.persistence.models import Document, KnowledgeBase, RawFileCleanup
 from app.rag.pipeline import IngestionPipeline
+from app.services.document_service import DocumentService
 from tests.conftest import FakeJobQueue, FakeQdrantStore
 
 _MARKDOWN = b"# Title\n\nThe quick brown fox jumps over the lazy dog.\n"
+
+
+class _FailingJobQueue(FakeJobQueue):
+    async def enqueue_ingest(self, kb_id: object, events: list[SourceEvent]) -> str:
+        raise ConnectionError("redis went away")
+
+
+class _CancelledJobQueue(FakeJobQueue):
+    async def enqueue_ingest(self, kb_id: object, events: list[SourceEvent]) -> str:
+        raise asyncio.CancelledError()
+
+
+class _BlockingCancelledJobQueue(FakeJobQueue):
+    def __init__(self, started: asyncio.Event, continue_event: asyncio.Event) -> None:
+        super().__init__()
+        self.started = started
+        self.continue_event = continue_event
+
+    async def enqueue_ingest(self, kb_id: object, events: list[SourceEvent]) -> str:
+        self.started.set()
+        await self.continue_event.wait()
+        raise asyncio.CancelledError()
+
+
+class _CleanupFailStorage(FileStorage):
+    def delete(self, rel_path: str) -> None:
+        raise OSError("disk is unavailable")
 
 
 @pytest.fixture
@@ -50,7 +82,7 @@ def _upload(
     kb_id: str,
     filename: str = "notes.md",
     data: bytes = _MARKDOWN,
-) -> Response:
+) -> Any:
     return client.post(
         f"/kbs/{kb_id}/documents",
         files={"file": (filename, data, "text/markdown")},
@@ -85,6 +117,110 @@ def test_given_unsupported_extension_when_uploading_then_rejected(
     assert 400 <= response.status_code < 500
 
 
+@pytest.mark.asyncio
+async def test_given_broker_error_and_cleanup_error_when_uploading_then_broker_error_is_preserved(
+    session_factory: Any, tmp_path: Path
+) -> None:
+    session = session_factory()
+    kb_id = uuid.uuid4()
+    session.add(KnowledgeBase(id=kb_id, name="Docs"))
+    session.commit()
+    service = DocumentService(session, _CleanupFailStorage(tmp_path), _FailingJobQueue())
+
+    with pytest.raises(ConnectionError, match="redis went away"):
+        await service.upload(kb_id, "notes.md", _MARKDOWN, max_upload_bytes=1024 * 1024)
+
+    assert session.scalar(select(Document).where(Document.kb_id == kb_id)) is None
+    assert session.scalar(select(RawFileCleanup).where(RawFileCleanup.kb_id == kb_id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_given_cancellation_and_cleanup_error_when_uploading_then_cancellation_is_preserved(
+    session_factory: Any, tmp_path: Path
+) -> None:
+    session = session_factory()
+    kb_id = uuid.uuid4()
+    session.add(KnowledgeBase(id=kb_id, name="Docs"))
+    session.commit()
+    service = DocumentService(session, _CleanupFailStorage(tmp_path), _CancelledJobQueue())
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.upload(kb_id, "notes.md", _MARKDOWN, max_upload_bytes=1024 * 1024)
+
+    assert session.scalar(select(RawFileCleanup).where(RawFileCleanup.kb_id == kb_id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_given_enqueue_cancellation_and_shared_raw_path_then_file_is_retained(
+    session_factory: Any, tmp_path: Path
+) -> None:
+    session = session_factory()
+    kb_id = uuid.uuid4()
+    session.add(KnowledgeBase(id=kb_id, name="Docs"))
+    session.commit()
+    storage = FileStorage(tmp_path)
+    existing = Document(
+        kb_id=kb_id,
+        uri="existing.md",
+        content_hash="",
+        mime="text/markdown",
+        raw_path="",
+        status="indexed",
+    )
+    raw_path, digest = storage.save(kb_id, _MARKDOWN)
+    existing.content_hash = digest
+    existing.raw_path = raw_path
+    session.add(existing)
+    session.commit()
+    service = DocumentService(session, storage, _CancelledJobQueue())
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.upload(kb_id, "new.md", _MARKDOWN, max_upload_bytes=1024 * 1024)
+
+    assert storage.read(raw_path) == _MARKDOWN
+
+
+@pytest.mark.asyncio
+async def test_given_upload_in_progress_when_deleting_kb_then_deletion_waits_for_upload(
+    session_factory: Any, tmp_path: Path
+) -> None:
+    from app.core.settings import Settings
+    from app.providers.registry import ProviderBundle, ProviderRegistry
+    from app.services.kb_service import KBService
+    from tests.conftest import StubEmbedder, StubQdrantStore
+
+    session = session_factory()
+    kb_id = uuid.uuid4()
+    session.add(KnowledgeBase(id=kb_id, name="Docs"))
+    session.commit()
+    started = asyncio.Event()
+    continue_event = asyncio.Event()
+    queue = _BlockingCancelledJobQueue(started, continue_event)
+    storage = FileStorage(tmp_path)
+    document_service = DocumentService(session, storage, queue)
+    registry = ProviderRegistry(
+        {
+            "ollama": ProviderBundle(StubEmbedder(), None, None),
+            "openai": ProviderBundle(StubEmbedder(), None, None),
+        }
+    )
+    kb_service = KBService(
+        session, Settings(), registry, StubQdrantStore(), storage, queue
+    )
+    upload_task = asyncio.create_task(
+        document_service.upload(kb_id, "notes.md", _MARKDOWN, max_upload_bytes=1024 * 1024)
+    )
+    await started.wait()
+    delete_task = asyncio.create_task(kb_service.delete_kb(kb_id))
+    await asyncio.sleep(0)
+    assert not delete_task.done()
+    continue_event.set()
+    with pytest.raises(asyncio.CancelledError):
+        await upload_task
+    await delete_task
+    assert session.get(KnowledgeBase, kb_id) is None
+
+
 def test_given_oversize_upload_when_uploading_then_413(
     client: TestClient, app: FastAPI
 ) -> None:
@@ -110,6 +246,25 @@ def test_given_over_limit_content_length_when_uploading_then_413(
 
     assert response.status_code == 413
     assert client.get(f"/kbs/{kb_id}/documents").json() == []
+
+
+def test_given_enqueue_failure_when_uploading_then_pending_row_and_file_are_rolled_back(
+    app: FastAPI,
+) -> None:
+    queue = _FailingJobQueue()
+    app.state.job_queue = queue
+    with TestClient(app) as client:
+        kb_id = _create_kb(client)
+        with pytest.raises(ConnectionError, match="redis went away"):
+            _upload(client, kb_id)
+
+    session = app.state.session_factory()
+    try:
+        assert session.scalars(select(Document)).all() == []
+    finally:
+        session.close()
+    kb_storage_path = Path(app.state.file_storage._root) / kb_id
+    assert not list(kb_storage_path.iterdir())
 
 
 def test_given_valid_markdown_when_uploading_then_202_and_enqueued(

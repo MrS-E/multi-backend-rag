@@ -26,6 +26,7 @@ from app.providers.registry import ProviderRegistry, get_registry
 from app.services.document_service import DocumentService
 from app.services.kb_service import KBService
 from app.services.query_service import QueryService
+from app.services.source_service import SourceService
 
 
 def get_settings_dep(request: Request) -> Settings:
@@ -80,9 +81,19 @@ def get_kb_service(
     registry: RegistryDep,
     qdrant: QdrantDep,
     storage: FileStorageDep,
+    queue: OptionalJobQueueDep,
+    request: Request,
 ) -> KBService:
     """Build the KB application service for the request."""
-    return KBService(session, settings, registry, qdrant, storage)
+    return KBService(
+        session,
+        settings,
+        registry,
+        qdrant,
+        storage,
+        queue,
+        getattr(request.app.state, "arq_pool", None),
+    )
 
 
 def get_arq_pool(request: Request) -> ArqRedis:
@@ -109,13 +120,27 @@ def get_job_queue(request: Request) -> JobQueue:
     return queue
 
 
+def get_optional_job_queue(request: Request) -> JobQueue | None:
+    """Return a queue when Redis is configured, without making reads require it."""
+    queue: JobQueue | None = getattr(request.app.state, "job_queue", None)
+    if queue is not None:
+        return queue
+    pool: ArqRedis | None = getattr(request.app.state, "arq_pool", None)
+    if pool is None:
+        return None
+    queue = JobQueue(pool)
+    request.app.state.job_queue = queue
+    return queue
+
+
 def get_document_service(
     session: SessionDep,
     storage: FileStorageDep,
     queue: JobQueueDep,
+    request: Request,
 ) -> DocumentService:
     """Build the document application service for the request."""
-    return DocumentService(session, storage, queue)
+    return DocumentService(session, storage, queue, getattr(request.app.state, "arq_pool", None))
 
 
 def get_query_service(
@@ -126,6 +151,12 @@ def get_query_service(
 ) -> QueryService:
     """Build the query application service for the request."""
     return QueryService(session, settings, registry, qdrant)
+
+
+def get_source_service(session: SessionDep, request: Request) -> SourceService:
+    """Build the source service with the app's optional queue override."""
+    queue = get_optional_job_queue(request)
+    return SourceService(session, queue, getattr(request.app.state, "arq_pool", None))
 
 
 def kb_access_dependency(role: str) -> Callable[..., None]:
@@ -171,9 +202,11 @@ QdrantDep = Annotated[QdrantStore, Depends(get_qdrant_store)]
 FileStorageDep = Annotated[FileStorage, Depends(get_file_storage)]
 ArqPoolDep = Annotated[ArqRedis, Depends(get_arq_pool)]
 JobQueueDep = Annotated[JobQueue, Depends(get_job_queue)]
+OptionalJobQueueDep = Annotated[JobQueue | None, Depends(get_optional_job_queue)]
 KBServiceDep = Annotated[KBService, Depends(get_kb_service)]
 DocumentServiceDep = Annotated[DocumentService, Depends(get_document_service)]
 QueryServiceDep = Annotated[QueryService, Depends(get_query_service)]
+SourceServiceDep = Annotated[SourceService, Depends(get_source_service)]
 
 #: Permission to read a KB (list/get/config).
 require_viewer = kb_access_dependency("viewer")

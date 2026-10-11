@@ -20,19 +20,19 @@ from app.domain.config_resolution import EffectiveConfig
 class KBOverrides(BaseModel):
     """Per-KB model/retrieval overrides; every field is optional."""
 
-    embed_model: str | None = None
-    chat_model: str | None = None
-    vision_model: str | None = None
-    chunk_size: int | None = Field(default=None, gt=0)
-    chunk_overlap: int | None = Field(default=None, ge=0)
-    top_k: int | None = Field(default=None, gt=0)
+    embed_model: str | None = Field(default=None, max_length=255)
+    chat_model: str | None = Field(default=None, max_length=255)
+    vision_model: str | None = Field(default=None, max_length=255)
+    chunk_size: int | None = Field(default=None, gt=0, le=100_000)
+    chunk_overlap: int | None = Field(default=None, ge=0, le=100_000)
+    top_k: int | None = Field(default=None, gt=0, le=100)
 
 
 class KBCreate(BaseModel):
     """Request body for ``POST /kbs``."""
 
     name: str = Field(min_length=1, max_length=255)
-    description: str = ""
+    description: str = Field(default="", max_length=10_000)
     overrides: KBOverrides | None = None
 
 
@@ -45,7 +45,7 @@ class KBUpdate(BaseModel):
     """
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
-    description: str | None = None
+    description: str | None = Field(default=None, max_length=10_000)
     overrides: KBOverrides | None = None
 
 

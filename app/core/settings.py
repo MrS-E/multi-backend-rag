@@ -64,10 +64,12 @@ class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
     max_upload_mb: int = 50
+    max_event_batch: int = Field(default=100, gt=0, le=10_000)
 
 
 class StorageConfig(BaseModel):
     root: str = "./storage"
+    sources_root: str | None = None
 
 
 class QdrantConfig(BaseModel):

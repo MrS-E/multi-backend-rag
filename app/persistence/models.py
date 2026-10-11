@@ -48,6 +48,11 @@ class KnowledgeBase(Base):
     owner_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     overrides: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reindex_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reindex_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -100,6 +105,21 @@ class Source(Base):
     sync_interval_s: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     cursor: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sync_claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    sync_claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     knowledge_base: Mapped[KnowledgeBase] = relationship(back_populates="sources")
+
+
+class RawFileCleanup(Base):
+    """Durable marker for raw files that could not be removed during KB deletion."""
+
+    __tablename__ = "raw_file_cleanups"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    kb_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False, index=True)
+    raw_path: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )

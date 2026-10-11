@@ -13,6 +13,7 @@ from app.api.deps import (
     require_owner,
     require_viewer,
 )
+from app.api.schemas.documents import JobAccepted
 from app.api.schemas.kbs import KBCreate, KBOut, KBOverrides, KBUpdate
 from app.domain.models import SYSTEM_SUBJECT
 from app.providers.registry import ProviderRegistry, UnknownProviderError
@@ -76,7 +77,7 @@ def get_kb(kb_id: uuid.UUID, service: KBServiceDep) -> KBOut:
 
 
 @router.patch("/{kb_id}", response_model=KBOut, dependencies=[Depends(require_owner)])
-def update_kb(
+async def update_kb(
     kb_id: uuid.UUID,
     payload: KBUpdate,
     service: KBServiceDep,
@@ -87,7 +88,7 @@ def update_kb(
     overrides = (
         payload.overrides.model_dump(exclude_unset=True) if payload.overrides is not None else None
     )
-    kb = service.update_kb(
+    kb = await service.update_kb(
         kb_id=kb_id,
         name=payload.name,
         description=payload.description,
@@ -101,6 +102,22 @@ def update_kb(
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_owner)],
 )
-def delete_kb(kb_id: uuid.UUID, service: KBServiceDep) -> None:
+async def delete_kb(kb_id: uuid.UUID, service: KBServiceDep) -> None:
     """Delete a KB, its Qdrant collection, stored files and DB rows."""
-    service.delete_kb(kb_id)
+    try:
+        await service.delete_kb(kb_id)
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+
+@router.post(
+    "/{kb_id}/reindex",
+    response_model=JobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_owner)],
+)
+async def retry_reindex(kb_id: uuid.UUID, service: KBServiceDep) -> JobAccepted:
+    """Enqueue a safe operator retry for a failed or required reindex."""
+    return JobAccepted(job_id=await service.retry_reindex(kb_id))

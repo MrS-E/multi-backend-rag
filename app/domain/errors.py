@@ -24,5 +24,9 @@ class ProviderError(DomainError):
     """A model provider call failed (unreachable, bad model, upstream error)."""
 
 
+class BrokerUnavailableError(DomainError):
+    """The Redis/arq broker could not service an operation."""
+
+
 class ConfigurationError(DomainError):
     """Configuration is invalid or incomplete (e.g. missing API key env var)."""

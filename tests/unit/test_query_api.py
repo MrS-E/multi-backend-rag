@@ -15,12 +15,13 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from app.persistence.models import KnowledgeBase
 from app.persistence.qdrant_store import SearchHit
 from app.providers.registry import ProviderBundle, ProviderRegistry
 from app.rag.generate import CHAT_OPTIONS
 from app.rag.sanitize import sanitize
 from app.services.query_service import NO_DOCUMENTS_ANSWER
-from tests.conftest import FakeQdrantStore, StubChat, StubEmbedder, StubVision
+from tests.conftest import FakeJobQueue, FakeQdrantStore, StubChat, StubEmbedder, StubVision
 
 
 @dataclass
@@ -177,11 +178,24 @@ def test_given_empty_kb_when_querying_then_graceful_answer_without_chat_call(
 
 
 def test_given_reindex_required_kb_when_querying_then_409(env: _Env) -> None:
+    env.app.state.job_queue = FakeJobQueue()
     kb_id = _seed_kb(env)
     patched = env.client.patch(
         f"/kbs/{kb_id}", json={"overrides": {"embed_model": "openai/text-embedding-3-large"}}
     )
     assert patched.json()["status"] == "reindex_required"
+
+    response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "How quick?"})
+
+    assert response.status_code == 409
+
+
+def test_given_reindexing_kb_when_querying_then_409(env: _Env) -> None:
+    kb_id = _seed_kb(env)
+    session = env.app.state.session_factory()
+    session.get(KnowledgeBase, uuid.UUID(kb_id)).status = "reindexing"
+    session.commit()
+    session.close()
 
     response = env.client.post(f"/kbs/{kb_id}/query", json={"question": "How quick?"})
 

@@ -15,6 +15,7 @@ SYSTEM_SUBJECT = "system"
 #: Knowledge-base lifecycle statuses.
 KB_STATUS_ACTIVE = "active"
 KB_STATUS_REINDEX_REQUIRED = "reindex_required"
+KB_STATUS_REINDEXING = "reindexing"
 KB_STATUS_COLLECTION_PENDING = "collection_pending"
 
 #: Document ingestion statuses persisted on the ``documents`` row.

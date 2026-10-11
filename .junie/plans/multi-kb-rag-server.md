@@ -295,7 +295,7 @@ Multi-BackendRag/
 
 # Delivery Steps
 
-###   Step 1: Scaffold project and infrastructure
+### ✓ Step 1: Scaffold project and infrastructure
 The repo boots: `docker compose up` starts Qdrant + Redis, `uvicorn` serves a health endpoint, and the database schema exists.
 
 - Create `pyproject.toml` (uv) with all dependencies: fastapi, uvicorn, arq, qdrant-client, sqlalchemy, alembic, pydantic-settings, docling, ollama, openai, langchain-text-splitters, httpx, pillow.
@@ -304,7 +304,7 @@ The repo boots: `docker compose up` starts Qdrant + Redis, `uvicorn` serves a he
 - Define SQLAlchemy models (`knowledge_bases` incl. nullable `owner_id`, `documents`, `sources`) + initial Alembic migration (no `jobs` table — job status is ephemeral in arq/Redis).
 - Implement `persistence/qdrant_store.py` (collection create/delete per KB) and `persistence/file_storage.py` (content-addressed raw storage).
 
-###   Step 2: Implement provider abstraction and KB management API
+### ✓ Step 2: Implement provider abstraction and KB management API
 KBs can be created with per-KB model overrides, and both model providers (Ollama, OpenAI-compatible) answer a test call through the provider registry.
 
 - Define provider ports (`EmbeddingProvider`, `ChatProvider`, `VisionProvider`) in `app/domain/ports.py`.
@@ -314,7 +314,7 @@ KBs can be created with per-KB model overrides, and both model providers (Ollama
 - Build the auth seam in `core/security.py`: `Principal`, `IdentityProvider` port with `none`/`api_key` implementations, `get_principal` + allow-all `require_kb_access` dependencies wired into all KB-scoped routers; `auth:` config section (`none|api_key`, OIDC keys reserved).
 - Unit-test config resolution for all override/fallback combinations.
 
-###   Step 3: Build ingestion pipeline, worker, and upload API
+### ✓ Step 3: Build ingestion pipeline, worker, and upload API
 Uploading md/txt/code/PDF/image files via API results in sanitized, captioned, embedded chunks in the KB's Qdrant collection, tracked by pollable (ephemeral) job status.
 
 - Set up arq worker (`workers/settings.py`, `jobs.py`) with the `ingest_events` job; job status served from arq's Redis metadata (ephemeral, configurable retention) via `GET /jobs/{id}`.
@@ -324,7 +324,7 @@ Uploading md/txt/code/PDF/image files via API results in sanitized, captioned, e
 - Add `POST /kbs/{id}/documents` (multipart, 202 + job id), document list, and document delete (removes vectors + files).
 - Unit-test pipeline stages; integration-test upload→indexed for each file type.
 
-###   Step 4: Implement query API with injection-protected prompting
+### ✓ Step 4: Implement query API with injection-protected prompting
 `POST /kbs/{id}/query` returns cited answers, with all retrieved content wrapped as untrusted CDATA data.
 
 - Implement `rag/retrieve.py` (embed query with KB's effective embed model, top-k search on the KB's collection).
@@ -333,7 +333,7 @@ Uploading md/txt/code/PDF/image files via API results in sanitized, captioned, e
 - Handle empty-KB and reindex-in-progress (`409`) cases.
 - Test injection resistance: documents containing instruction-like text and `]]>` sequences do not alter model behavior or break prompt structure.
 
-###   Step 5: Add source connector framework with event and pull modes
+### * Step 5: Add source connector framework with event and pull modes
 Sources can be registered on a KB in event or pull mode; pull sources sync automatically on their configured interval, and new connector types plug in via one interface.
 
 - Define `SourceConnector` port + `SourceEvent` (Upsert/Delete) and a connector registry in `app/interaction/`.

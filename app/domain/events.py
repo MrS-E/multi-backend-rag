@@ -9,12 +9,21 @@ stored the raw file can pass its ``path`` instead.
 from __future__ import annotations
 
 import base64
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
 #: Discriminator values for the serialized event form.
 EVENT_UPSERT = "upsert"
 EVENT_DELETE = "delete"
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def normalize_sha256(value: str | None) -> str | None:
+    """Normalize a valid SHA-256 hex digest before it crosses a boundary."""
+    if isinstance(value, str) and _SHA256_RE.fullmatch(value):
+        return value.lower()
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +42,10 @@ class UpsertEvent:
     content_hash: str | None = None
     data: bytes | None = None
     path: str | None = None
+
+    def __post_init__(self) -> None:
+        """Keep valid digest values canonical for direct and serialized events."""
+        object.__setattr__(self, "content_hash", normalize_sha256(self.content_hash))
 
     def to_payload(self) -> dict[str, Any]:
         """Serialize to a JSON-safe mapping for the arq job arguments."""
@@ -60,8 +73,8 @@ class UpsertEvent:
             uri=str(payload["uri"]),
             mime=str(payload["mime"]),
             metadata=dict(payload.get("metadata") or {}),
-            content_hash=payload.get("content_hash"),
-            data=base64.b64decode(encoded) if encoded is not None else None,
+            content_hash=normalize_sha256(payload.get("content_hash")),
+            data=base64.b64decode(encoded, validate=True) if encoded is not None else None,
             path=payload.get("path"),
         )
 

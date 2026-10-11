@@ -20,17 +20,24 @@ from __future__ import annotations
 import hashlib
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from pathlib import PurePosixPath
 
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
+from app.core.coordination import LeaseLostError
 from app.core.settings import Settings
 from app.domain.config_resolution import EffectiveConfig, resolve_effective_config
-from app.domain.events import DeleteEvent, SourceEvent, UpsertEvent
+from app.domain.events import DeleteEvent, SourceEvent, UpsertEvent, normalize_sha256
 from app.domain.models import DOC_STATUS_FAILED, DOC_STATUS_INDEXED
 from app.persistence.file_storage import FileStorage
-from app.persistence.models import Document, KnowledgeBase
+from app.persistence.models import Document, KnowledgeBase, Source
 from app.persistence.qdrant_store import QdrantStore
+from app.persistence.raw_cleanup import (
+    ensure_raw_file_cleanup_marker,
+    remove_raw_file_cleanup_marker,
+)
 from app.providers.registry import ProviderRegistry, parse_model_str
 from app.rag.caption import caption_image
 from app.rag.chunk import Chunk, split_into_chunks
@@ -89,34 +96,49 @@ class IngestionPipeline:
         registry: ProviderRegistry,
         qdrant: QdrantStore,
         storage: FileStorage,
+        lease_check: Callable[[], None] | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._registry = registry
         self._qdrant = qdrant
         self._storage = storage
+        self._lease_check = lease_check
 
-    def process_events(self, kb_id: uuid.UUID, events: Sequence[SourceEvent]) -> None:
+    def _fence(self) -> None:
+        """Stop before a backend mutation when the coordinating lease is lost."""
+        if self._lease_check is not None:
+            self._lease_check()
+
+    def process_events(
+        self, kb_id: uuid.UUID, events: Sequence[SourceEvent], force: bool = False
+    ) -> None:
         """Process every event for ``kb_id`` in order."""
         for event in events:
             if isinstance(event, DeleteEvent):
                 self.process_delete(kb_id, event)
             elif isinstance(event, UpsertEvent):
-                self.process_upsert(kb_id, event)
+                self.process_upsert(kb_id, event, force=force)
             else:  # pragma: no cover - exhaustive over the SourceEvent union
                 raise ValueError(f"unsupported source event {event!r}")
 
-    def process_upsert(self, kb_id: uuid.UUID, event: UpsertEvent) -> None:
+    def process_upsert(self, kb_id: uuid.UUID, event: UpsertEvent, force: bool = False) -> None:
         """Index (or re-index) a document, skipping unchanged content."""
         kb = self._require_kb(kb_id)
+        self._validate_source_id(kb_id, event)
         config = resolve_effective_config(self._settings.defaults, kb.overrides)
         doc_uuid = document_uuid(event.doc_id)
-        data = self._load_bytes(event)
-        content_hash = event.content_hash or sha256_hex(data)
-
         existing = self._session.get(Document, doc_uuid)
+        self._reject_cross_kb_document(existing, kb_id, doc_uuid)
+        data = self._load_bytes(event, kb_id)
+        actual_hash = sha256_hex(data)
+        event_hash = normalize_sha256(event.content_hash)
+        if event_hash is not None and event_hash != actual_hash:
+            raise ValueError(f"content_hash does not match event data for {event.doc_id!r}")
+        content_hash = actual_hash
         if (
-            existing is not None
+            not force
+            and existing is not None
             and existing.status == DOC_STATUS_INDEXED
             and existing.content_hash == content_hash
         ):
@@ -137,6 +159,7 @@ class IngestionPipeline:
         try:
             indexed, vectors = self._prepare(kb_id, event, data, content_hash, config)
             self._ensure_collection(kb_id, vectors)
+            self._fence()
             index_chunks(kb_id, event.doc_id, indexed, vectors, self._qdrant)
         except Exception:
             self._update_row(kb_id, doc_uuid, event, raw_path, content_hash, DOC_STATUS_FAILED)
@@ -150,22 +173,18 @@ class IngestionPipeline:
         """Remove a document's vectors, stored file and DB row."""
         self._require_kb(kb_id)
         doc_uuid = document_uuid(event.doc_id)
-        self._delete_vectors(kb_id, event.doc_id)
-
         document = self._session.get(Document, doc_uuid)
+        self._reject_cross_kb_document(document, kb_id, doc_uuid)
         if document is None:
+            self._delete_vectors(kb_id, event.doc_id)
             return
         raw_path = document.raw_path
+        self._delete_vectors(kb_id, event.doc_id)
+        self._fence()
         self._session.delete(document)
+        self._fence()
         self._session.commit()
-
-        try:
-            self._storage.delete(raw_path)
-        except Exception as exc:  # noqa: BLE001 - best-effort file cleanup
-            logger.warning(
-                "failed to delete stored file",
-                extra={"kb_id": str(kb_id), "doc_id": event.doc_id, "error": str(exc)},
-            )
+        self._delete_raw_if_unreferenced(raw_path, kb_id=kb_id, doc_id=doc_uuid)
 
     def _require_kb(self, kb_id: uuid.UUID) -> KnowledgeBase:
         kb = self._session.get(KnowledgeBase, kb_id)
@@ -173,18 +192,34 @@ class IngestionPipeline:
             raise ValueError(f"knowledge base {kb_id} not found")
         return kb
 
-    def _load_bytes(self, event: UpsertEvent) -> bytes:
+    def _load_bytes(self, event: UpsertEvent, kb_id: uuid.UUID) -> bytes:
         """Return the event's content, reading the stored file when only a path is given."""
+        max_bytes = self._settings.server.max_upload_mb * 1024 * 1024
         if event.data is not None:
+            if len(event.data) > max_bytes:
+                raise ValueError("event data exceeds the configured upload limit")
             return event.data
         if event.path is not None:
-            return self._storage.read(event.path)
+            path = PurePosixPath(event.path)
+            if (
+                path.is_absolute()
+                or len(path.parts) != 2
+                or path.parts[0] != str(kb_id)
+                or len(path.parts[1]) != 64
+                or any(character not in "0123456789abcdef" for character in path.parts[1])
+            ):
+                raise ValueError("stored event path must be a content-addressed path in its KB")
+            data = self._storage.read(event.path, max_bytes=max_bytes)
+            if sha256_hex(data) != path.parts[1]:
+                raise ValueError("stored event path does not match its content hash")
+            return data
         raise ValueError(f"upsert event for {event.doc_id!r} carries neither data nor path")
 
     def _store(self, event: UpsertEvent, kb_id: uuid.UUID, data: bytes) -> str:
         """Persist inline bytes (content-addressed) or reuse the event's stored path."""
         if event.path is not None:
             return event.path
+        self._fence()
         rel_path, _ = self._storage.save(kb_id, data)
         return rel_path
 
@@ -194,22 +229,68 @@ class IngestionPipeline:
         """Delete the previous raw file when a changed document moved to a new path."""
         if existing is None or old_raw_path is None or old_raw_path == raw_path:
             return
+        self._delete_raw_if_unreferenced(old_raw_path, kb_id=existing.kb_id, doc_id=existing.id)
+
+    def _delete_raw_if_unreferenced(
+        self, raw_path: str, kb_id: uuid.UUID, doc_id: uuid.UUID | None = None
+    ) -> None:
+        """Delete a raw file only after confirming no document still references it."""
+        statement = select(exists().where(Document.raw_path == raw_path))
+        if doc_id is not None:
+            statement = select(
+                exists().where(Document.raw_path == raw_path, Document.id != doc_id)
+            )
+        if self._session.scalar(statement):
+            return
         try:
-            self._storage.delete(old_raw_path)
+            self._fence()
+            self._storage.delete(raw_path)
+            remove_raw_file_cleanup_marker(self._session, raw_path)
+            self._session.commit()
+        except LeaseLostError:
+            self._session.rollback()
+            raise
         except Exception as exc:  # noqa: BLE001 - best-effort file cleanup
+            self._session.rollback()
+            try:
+                ensure_raw_file_cleanup_marker(self._session, kb_id, raw_path)
+                self._session.commit()
+            except Exception:  # noqa: BLE001 - preserve the indexing outcome
+                self._session.rollback()
             logger.warning(
-                "failed to delete replaced file",
+                "failed to delete unreferenced stored file",
                 extra={
-                    "doc_id": str(existing.id),
-                    "raw_path": old_raw_path,
+                    "kb_id": str(kb_id) if kb_id is not None else None,
+                    "raw_path": raw_path,
                     "error": str(exc),
                 },
             )
+
+    def _reject_cross_kb_document(
+        self, document: Document | None, kb_id: uuid.UUID, doc_uuid: uuid.UUID
+    ) -> None:
+        """Reject an event that tries to address a document owned by another KB."""
+        if document is not None and document.kb_id != kb_id:
+            raise ValueError(f"document {doc_uuid} does not belong to knowledge base {kb_id}")
+
+    def _validate_source_id(self, kb_id: uuid.UUID, event: UpsertEvent) -> None:
+        """Reject UUID source metadata that is not owned by the target KB."""
+        source_id = event.metadata.get(SOURCE_ID_KEY)
+        if source_id is None:
+            return
+        try:
+            source_uuid = uuid.UUID(str(source_id))
+        except (ValueError, AttributeError, TypeError):
+            return
+        source = self._session.get(Source, source_uuid)
+        if source is None or source.kb_id != kb_id:
+            raise ValueError(f"source {source_uuid} does not belong to knowledge base {kb_id}")
 
     def _delete_vectors(self, kb_id: uuid.UUID, doc_id: str) -> None:
         """Delete a document's vectors, no-op when its KB has no collection yet."""
         if not self._qdrant.collection_exists(kb_id):
             return
+        self._fence()
         delete_document(kb_id, doc_id, self._qdrant)
 
     def _prepare(
@@ -275,6 +356,7 @@ class IngestionPipeline:
         if not vectors:
             return
         if not self._qdrant.collection_exists(kb_id):
+            self._fence()
             self._qdrant.create_collection(kb_id, len(vectors[0]))
 
     def _resolve_image(self, path: str) -> bytes | None:
@@ -294,11 +376,20 @@ class IngestionPipeline:
         status: str,
     ) -> None:
         """Create or update the ``documents`` row for an upsert."""
-        document = self._session.get(Document, doc_uuid)
+        source_id = event.metadata.get(SOURCE_ID_KEY)
+        try:
+            source_uuid = uuid.UUID(str(source_id)) if source_id is not None else None
+        except (ValueError, AttributeError, TypeError):
+            source_uuid = None
+        document = self._session.scalar(
+            select(Document).where(Document.id == doc_uuid, Document.kb_id == kb_id)
+        )
+        self._fence()
         if document is None:
             document = Document(
                 id=doc_uuid,
                 kb_id=kb_id,
+                source_id=source_uuid,
                 uri=event.uri,
                 content_hash=content_hash,
                 mime=event.mime,
@@ -307,9 +398,11 @@ class IngestionPipeline:
             )
             self._session.add(document)
         else:
+            document.source_id = source_uuid
             document.uri = event.uri
             document.content_hash = content_hash
             document.mime = event.mime
             document.raw_path = raw_path
             document.status = status
+        self._fence()
         self._session.commit()

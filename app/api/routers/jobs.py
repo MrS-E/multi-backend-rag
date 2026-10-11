@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from app.api.deps import ArqPoolDep
 from app.api.schemas.documents import JobStatusOut
+from app.domain.errors import BrokerUnavailableError
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -28,14 +29,20 @@ _STATUS_MAP: dict[JobStatus, str] = {
 async def get_job_status(job_id: str, pool: ArqPoolDep) -> JobStatusOut:
     """Return the status of a job, or ``404`` when it is unknown or expired."""
     job = Job(job_id, pool)
-    job_status = await job.status()
+    try:
+        job_status = await job.status()
+    except Exception as exc:  # noqa: BLE001 - arq status reads are broker operations
+        raise BrokerUnavailableError("job broker unavailable") from exc
     if job_status is JobStatus.not_found:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="job not found")
 
     if job_status is not JobStatus.complete:
         return JobStatusOut(status=_STATUS_MAP.get(job_status, "failed"))
 
-    result = await job.result_info()
+    try:
+        result = await job.result_info()
+    except Exception as exc:  # noqa: BLE001 - arq result reads are broker operations
+        raise BrokerUnavailableError("job broker unavailable") from exc
     if result is not None and not result.success:
         return JobStatusOut(status="failed", error=_error_message(result.result))
     return JobStatusOut(status="done")

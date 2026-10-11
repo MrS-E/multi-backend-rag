@@ -148,14 +148,24 @@ class FakeQdrantStore:
 
 
 class FakeJobQueue:
-    """Job-queue stand-in: records enqueued events and returns a deterministic id."""
+    """Job-queue stand-in: records enqueued jobs and returns a deterministic id."""
 
     def __init__(self, job_id: str = "job-1") -> None:
         self.job_id = job_id
         self.enqueued: list[tuple[Any, list[SourceEvent]]] = []
+        self.synced: list[Any] = []
+        self.reindexed: list[Any] = []
 
     async def enqueue_ingest(self, kb_id: Any, events: list[SourceEvent]) -> str:
         self.enqueued.append((kb_id, list(events)))
+        return self.job_id
+
+    async def enqueue_sync(self, source_id: Any) -> str:
+        self.synced.append(source_id)
+        return self.job_id
+
+    async def enqueue_reindex(self, kb_id: Any) -> str:
+        self.reindexed.append(kb_id)
         return self.job_id
 
 

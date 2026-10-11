@@ -14,12 +14,15 @@ import uuid
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
 
+from app.domain.errors import BrokerUnavailableError
 from app.domain.events import SourceEvent
 
 logger = logging.getLogger(__name__)
 
-#: Name of the arq function the API enqueues for ingestion.
+#: Names of the arq functions the API enqueues.
 INGEST_EVENTS_JOB = "ingest_events"
+SYNC_SOURCE_JOB = "sync_source"
+REINDEX_KB_JOB = "reindex_kb"
 
 
 def redis_settings_from_url(redis_url: str) -> RedisSettings:
@@ -50,11 +53,34 @@ class JobQueue:
 
     async def enqueue_ingest(self, kb_id: uuid.UUID, events: list[SourceEvent]) -> str:
         """Enqueue ``ingest_events`` for ``kb_id`` and return the new job id."""
-        job = await self._pool.enqueue_job(
-            INGEST_EVENTS_JOB,
-            str(kb_id),
-            [event.to_payload() for event in events],
-        )
+        try:
+            job = await self._pool.enqueue_job(
+                INGEST_EVENTS_JOB,
+                str(kb_id),
+                [event.to_payload() for event in events],
+            )
+        except Exception as exc:  # noqa: BLE001 - broker failures are an API 503
+            raise BrokerUnavailableError("job broker unavailable") from exc
         if job is None:
-            raise RuntimeError("arq refused to enqueue the ingestion job")
+            raise BrokerUnavailableError("job broker unavailable")
+        return job.job_id
+
+    async def enqueue_sync(self, source_id: uuid.UUID) -> str:
+        """Enqueue one pull-source synchronization."""
+        try:
+            job = await self._pool.enqueue_job(SYNC_SOURCE_JOB, str(source_id))
+        except Exception as exc:  # noqa: BLE001 - broker failures are an API 503
+            raise BrokerUnavailableError("job broker unavailable") from exc
+        if job is None:
+            raise BrokerUnavailableError("job broker unavailable")
+        return job.job_id
+
+    async def enqueue_reindex(self, kb_id: uuid.UUID) -> str:
+        """Enqueue a full KB reindex."""
+        try:
+            job = await self._pool.enqueue_job(REINDEX_KB_JOB, str(kb_id))
+        except Exception as exc:  # noqa: BLE001 - broker failures are an API 503
+            raise BrokerUnavailableError("job broker unavailable") from exc
+        if job is None:
+            raise BrokerUnavailableError("job broker unavailable")
         return job.job_id

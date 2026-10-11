@@ -18,6 +18,7 @@ from typing import Any
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qmodels
+from qdrant_client.http.exceptions import UnexpectedResponse
 
 from app.core.settings import get_settings
 
@@ -58,7 +59,11 @@ class QdrantStore:
 
     def delete_collection(self, kb_id: uuid.UUID | str) -> None:
         """Delete the KB's collection if it exists."""
-        self._client.delete_collection(collection_name(kb_id))
+        try:
+            self._client.delete_collection(collection_name(kb_id))
+        except UnexpectedResponse as exc:
+            if getattr(exc, "status_code", None) != 404:
+                raise
 
     def upsert(
         self,
